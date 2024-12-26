@@ -1,0 +1,730 @@
+@ドット数
+--track0:拡大率,0,4000,100,0.01
+--track1:X,0,4000,100,0.01
+--track2:Y,0,4000,100,0.01
+--track3:境界ﾀｲﾌﾟ,0,5,0,1
+--dialog:ドット数でサイズ指定/chk,_0=0;ｽｸﾘｰﾝに合わせる/chk,_1=0;補間なし/chk,_2=0;維持基準[0:短/1:長]/chk,_3=0;境界ﾀｲﾌﾟ[1]:色/col,_4=0x000000;境界ﾀｲﾌﾟ[5]:ぼかし,_5=30;
+--check0:縦横比を維持,1
+
+local xy                 = obj.track0
+local x, y               = obj.track1, obj.track2
+local border_type        = obj.track3
+local keep_aspect_ratio  = obj.check0
+local dot           = _0 ~= 0 _0 = nil
+local fit_to_screen = _1 ~= 0 _1 = nil
+local interp        = _2      _2 = nil
+local ratio_base    = _3 ~= 0 _3 = nil
+local color         = _4      _4 = nil
+local blur_strength = _5 or 0 _5 = nil
+
+local w, h = obj.getpixel()
+if w * h == 0 then
+    return
+end
+
+local lua_jit, ffi = pcall(require, "ffi")
+if lua_jit == true then
+    pcall(ffi.cdef, [[
+        typedef struct {
+            uint8_t b, g, r, a;
+        } PixelBGRA;
+    ]])
+end
+
+obj.copybuffer("cache:oar_rsz_dot_ori_img", "obj")
+
+if fit_to_screen then
+    obj.zoom = 1 / (obj.w / w)
+end
+
+-- 短い辺に合わせる
+local function minFit(pixel_w, pixel_h, dst_w, dst_h)
+    local min_fit_w = math.floor(dst_h * (pixel_w / pixel_h))
+    local min_fit_h = math.floor(dst_w * (pixel_h / pixel_w))
+
+    if dst_w < min_fit_w then min_fit_w = dst_w end
+    if dst_h < min_fit_h then min_fit_h = dst_h end
+
+    return min_fit_w, min_fit_h
+end
+
+-- 長い辺に合わせる
+local function maxFit(pixel_w, pixel_h, dst_w, dst_h)
+    local max_fit_w = math.floor(dst_h * (pixel_w / pixel_h))
+    local max_fit_h = math.floor(dst_w * (pixel_h / pixel_w))
+
+    if dst_w > max_fit_w then max_fit_w = dst_w end
+    if dst_h > max_fit_h then max_fit_h = dst_h end
+
+    return max_fit_w, max_fit_h
+end
+
+-- ループ
+local function warp(idx, size)
+    if size == 1 then return 0 end
+    idx = ((idx % size) + size) % size
+    return idx
+end
+
+-- 鏡面反射
+local function reflect(idx, size)
+    if size == 1 then return 0 end
+    local range = (size - 1) * 2
+    idx = math.abs(idx) % range
+    if idx >= size then
+        idx = math.max(range - idx, 0)
+    end
+    return idx
+end
+
+local dst_w, dst_h
+local max_w, max_h = obj.getinfo("image_max")
+
+if fit_to_screen then
+    dst_w = math.min(obj.screen_w, max_w)
+    dst_h = math.min(obj.screen_h, max_h)
+elseif dot then
+    dst_w = math.min(math.floor(x), max_w)
+    dst_h = math.min(math.floor(y), max_h)
+else
+    dst_w = math.min(math.floor(math.floor(x/100 * w) * xy/100), max_w)
+    dst_h = math.min(math.floor(math.floor(y/100 * h) * xy/100), max_h)
+end
+
+if dst_w * dst_h == 0 then
+    obj.effect("リサイズ", "拡大率", 0)
+    return
+end
+
+local min_fit_w, min_fit_h = minFit(w, h, dst_w, dst_h)
+if min_fit_w * min_fit_h == 0 then
+    obj.effect("リサイズ", "拡大率", 0)
+    return
+end
+
+-- 境界処理
+if keep_aspect_ratio then
+
+    -- 長い辺に合わせる
+    if ratio_base then
+        local max_fit_w, max_fit_h = maxFit(w, h, dst_w, dst_h)
+        obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+        obj.effect("リサイズ", "X", max_fit_w, "Y", max_fit_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+        obj.draw()
+        obj.copybuffer("obj", "tmp")
+    else
+        -- 透明
+        if border_type == 0 then
+            obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+            obj.effect("リサイズ", "X", min_fit_w, "Y", min_fit_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+            obj.draw()
+            obj.copybuffer("obj", "tmp")
+
+        -- 塗りつぶし
+        elseif border_type == 1 then
+            obj.effect("リサイズ", "X", min_fit_w, "Y", min_fit_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+
+            local cx = math.ceil ((dst_w - min_fit_w) / 2)
+            local fx = math.floor((dst_w - min_fit_w) / 2)
+            local cy = math.ceil ((dst_h - min_fit_h) / 2)
+            local fy = math.floor((dst_h - min_fit_h) / 2)
+
+            local r, g, b = RGB(color)
+
+            if lua_jit == false then
+                obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+                obj.draw()
+                obj.copybuffer("obj", "tmp")
+
+                obj.pixeloption("type", "rgb")
+                for y=0, dst_h-1 do
+                    for x=0, dst_w-1 do
+                        if (x < cx or x >= fx + min_fit_w) or (y < cy or y >= fy + min_fit_h) then
+                            obj.putpixel(x, y, r, g, b, 255)
+                        end
+                    end
+                end
+            else
+                local src_data, _, _ = obj.getpixeldata("alloc")
+                local csrc = ffi.cast("PixelBGRA*", src_data)
+
+                obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+                obj.draw()
+                obj.copybuffer("obj", "tmp")
+
+                local dst_data, _, _ = obj.getpixeldata("alloc")
+                local cdst = ffi.cast("PixelBGRA*", dst_data)
+
+                for y=0, dst_h-1 do
+                    for x=0, dst_w-1 do
+                        if (x < cx or x >= fx + min_fit_w) or (y < cy or y >= fy + min_fit_h) then
+                            cdst[y * dst_w + x] = {g, b, r, 255}
+                        end
+                    end
+                end
+                obj.putpixeldata(dst_data)
+            end
+
+        -- 拡張
+        elseif border_type == 2 then
+            obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+            obj.effect("リサイズ", "X", min_fit_w, "Y", min_fit_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+
+            local pad_w = math.ceil((dst_w - min_fit_w) / 2)
+            local pad_h = math.ceil((dst_h - min_fit_h) / 2)
+            obj.effect("領域拡張", "上", pad_h, "下", pad_h, "左", pad_w, "右", pad_w, "塗りつぶし", 1)
+
+            obj.draw()
+            obj.copybuffer("obj", "tmp")
+
+        -- ループ
+        elseif border_type == 3 then
+            obj.effect("リサイズ", "X", min_fit_w, "Y", min_fit_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+
+            local cx = math.ceil ((dst_w - min_fit_w) / 2)
+            local fx = math.floor((dst_w - min_fit_w) / 2)
+            local cy = math.ceil ((dst_h - min_fit_h) / 2)
+            local fy = math.floor((dst_h - min_fit_h) / 2)
+
+            if lua_jit == false then
+                -- 短い辺に合わせた画像をサンプリングしておく
+                local pixels = {}
+                for y=1, min_fit_h do
+                    pixels[y] = {}
+                    for x=1, min_fit_w do
+                        pixels[y][x] = {obj.getpixel(x-1, y-1, "col")}
+                    end
+                end
+
+                -- リサイズ後の大きさの仮想バッファの上に描画
+                obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+                obj.draw()
+                obj.copybuffer("obj", "tmp")
+
+                -- 境界部分に短い辺に合わせた画像を描画
+                for y=0, dst_h-1 do
+                    for x=0, dst_w-1 do
+                        if (x < cx or x >= fx + min_fit_w) or (y < cy or y >= fy + min_fit_h) then
+                            local warp_x = warp(x - cx, min_fit_w)
+                            local warp_y = warp(y - cy, min_fit_h)
+                            obj.putpixel(x, y, pixels[warp_y+1][warp_x+1][1], pixels[warp_y+1][warp_x+1][2])
+                        end
+                    end
+                end
+            else
+                local src_data, _, _ = obj.getpixeldata("alloc")
+                local csrc = ffi.cast("PixelBGRA*", src_data)
+
+                obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+                obj.draw()
+                obj.copybuffer("obj", "tmp")
+
+                local dst_data, _, _ = obj.getpixeldata("alloc")
+                local cdst = ffi.cast("PixelBGRA*", dst_data)
+
+                for y=0, dst_h-1 do
+                    for x=0, dst_w-1 do
+                        if (x < cx or x >= fx + min_fit_w) or (y < cy or y >= fy + min_fit_h) then
+                            local warp_x = warp(x - cx, min_fit_w)
+                            local warp_y = warp(y - cy, min_fit_h)
+                            cdst[y * dst_w + x] = csrc[warp_y * min_fit_w + warp_x]
+                        end
+                    end
+                end
+                obj.putpixeldata(dst_data)
+            end
+
+        -- 反射
+        elseif border_type == 4 then
+            obj.effect("リサイズ", "X", min_fit_w, "Y", min_fit_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+
+            local cx = math.ceil ((dst_w - min_fit_w) / 2)
+            local fx = math.floor((dst_w - min_fit_w) / 2)
+            local cy = math.ceil ((dst_h - min_fit_h) / 2)
+            local fy = math.floor((dst_h - min_fit_h) / 2)
+
+            if lua_jit == false then
+                local pixels = {}
+                for y=1, min_fit_h do
+                    pixels[y] = {}
+                    for x=1, min_fit_w do
+                        pixels[y][x] = {obj.getpixel(x-1, y-1, "col")}
+                    end
+                end
+
+                obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+                obj.draw()
+                obj.copybuffer("obj", "tmp")
+
+                for y=0, dst_h-1 do
+                    for x=0, dst_w-1 do
+                        if (x < cx or x >= fx + min_fit_w) or (y < cy or y >= fy + min_fit_h) then
+                            local ref_x = reflect(x - cx, min_fit_w)
+                            local ref_y = reflect(y - cy, min_fit_h)
+                            obj.putpixel(x, y, pixels[ref_y+1][ref_x+1][1], pixels[ref_y+1][ref_x+1][2])
+                        end
+                    end
+                end
+            else
+                local src_data, _, _ = obj.getpixeldata("alloc")
+                local csrc = ffi.cast("PixelBGRA*", src_data)
+
+                obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+                obj.draw()
+                obj.copybuffer("obj", "tmp")
+
+                local dst_data, _, _ = obj.getpixeldata("alloc")
+                local cdst = ffi.cast("PixelBGRA*", dst_data)
+
+                for y=0, dst_h-1 do
+                    for x=0, dst_w-1 do
+                        if (x < cx or x >= fx + min_fit_w) or (y < cy or y >= fy + min_fit_h) then
+                            local ref_x = reflect(x - cx, min_fit_w)
+                            local ref_y = reflect(y - cy, min_fit_h)
+                            cdst[y * dst_w + x] = csrc[ref_y * min_fit_w + ref_x]
+                        end
+                    end
+                end
+                obj.putpixeldata(dst_data)
+            end
+
+        -- ぼかし
+        elseif border_type == 5 then
+            obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+
+            -- 長い辺に合わせた画像をぼかして描画
+            local max_fit_w, max_fit_h = maxFit(w, h, dst_w, dst_h)
+            obj.effect("リサイズ", "X", max_fit_w, "Y", max_fit_h, "補間なし", 0, "ドット数でサイズ指定", 1)
+            obj.effect("ぼかし", "範囲", blur_strength, "サイズ固定", 1)
+            obj.draw()
+            obj.copybuffer("obj", "tmp")
+
+            local cx = math.ceil ((dst_w - min_fit_w) / 2)
+            local fx = math.floor((dst_w - min_fit_w) / 2)
+            local cy = math.ceil ((dst_h - min_fit_h) / 2)
+            local fy = math.floor((dst_h - min_fit_h) / 2)
+
+            if lua_jit == false then
+                -- ぼかした画像をサンプリングしておく
+                local pixels = {}
+                for y=1, dst_h do
+                    pixels[y] = {}
+                    for x=1, dst_w do
+                        pixels[y][x] = {obj.getpixel(x-1, y-1, "col")}
+                    end
+                end
+
+                -- 短い辺に合わせてリサイズした画像を描画
+                obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+                obj.copybuffer("obj", "cache:oar_rsz_dot_ori_img")
+                obj.effect("リサイズ", "X", min_fit_w, "Y", min_fit_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+                obj.draw()
+                obj.copybuffer("obj", "tmp")
+
+                -- 境界部分ににぼかした画像を描画
+                for y=0, dst_h-1 do
+                    for x=0, dst_w-1 do
+                        if (x < cx or x >= fx + min_fit_w) or (y < cy or y >= fy + min_fit_h) then
+                            obj.putpixel(x, y, pixels[y+1][x+1][1], pixels[y+1][x+1][2])
+                        end
+                    end
+                end
+            else
+                local src_data, _, _ = obj.getpixeldata("alloc")
+                local csrc = ffi.cast("PixelBGRA*", src_data)
+
+                obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+                obj.copybuffer("obj", "cache:oar_rsz_dot_ori_img")
+                obj.effect("リサイズ", "X", min_fit_w, "Y", min_fit_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+                obj.draw()
+                obj.copybuffer("obj", "tmp")
+
+                local dst_data, _, _ = obj.getpixeldata("alloc")
+                local cdst = ffi.cast("PixelBGRA*", dst_data)
+
+                for y=0, dst_h-1 do
+                    for x=0, dst_w-1 do
+                        if (x < cx or x >= fx + min_fit_w) or (y < cy or y >= fy + min_fit_h) then
+                            cdst[y * dst_w + x] = csrc[y * dst_w + x]
+                        end
+                    end
+                end
+                obj.putpixeldata(dst_data)
+            end
+        end
+    end
+else
+    if dot then
+        obj.effect("リサイズ", "X", dst_w, "Y", dst_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+    else
+        obj.effect("リサイズ", "拡大率", xy, "X", x, "Y", y, "補間なし", interp, "ドット数でサイズ指定", 0)
+    end
+end
+
+
+
+@アンカー
+--track0:時間経過,0,100,0
+--track1:境界ﾀｲﾌﾟ,0,5,0,1
+--dialog:座標,pos={-100,-100,100,100};反転なし/chk,_0=0;補間なし/chk,_1=0;維持基準[0:短/1:長]/chk,_2=0;境界ﾀｲﾌﾟ[1]:色/col,_3=0x000000;境界ﾀｲﾌﾟ[5]:ぼかし,_4=30;
+--check0:縦横比を維持,1
+
+local time               = obj.track0
+local border_type        = obj.track1
+local keep_aspect_ratio  = obj.check0
+local flip          = _0 ~= 0 _0 = nil
+local interp        = _1      _1 = nil
+local ratio_base    = _2 ~= 0 _2 = nil
+local color         = _3      _3 = nil
+local blur_strength = _4 or 0 _4 = nil
+
+local w, h = obj.getpixel()
+if w * h == 0 then
+    return
+end
+
+local lua_jit, ffi = pcall(require, "ffi")
+if lua_jit == true then
+    pcall(ffi.cdef, [[
+        typedef struct {
+            uint8_t b, g, r, a;
+        } PixelBGRA;
+    ]])
+end
+
+obj.copybuffer("cache:oar_rsz_anc_ori_img", "obj")
+
+-- 短い辺に合わせる
+local function minFit(pixel_w, pixel_h, dst_w, dst_h)
+    local min_fit_w = math.floor(dst_h * (pixel_w / pixel_h))
+    local min_fit_h = math.floor(dst_w * (pixel_h / pixel_w))
+
+    if dst_w < min_fit_w then min_fit_w = dst_w end
+    if dst_h < min_fit_h then min_fit_h = dst_h end
+
+    return min_fit_w, min_fit_h
+end
+
+-- 長い辺に合わせる
+local function maxFit(pixel_w, pixel_h, dst_w, dst_h)
+    local max_fit_w = math.floor(dst_h * (pixel_w / pixel_h))
+    local max_fit_h = math.floor(dst_w * (pixel_h / pixel_w))
+
+    if dst_w > max_fit_w then max_fit_w = dst_w end
+    if dst_h > max_fit_h then max_fit_h = dst_h end
+
+    return max_fit_w, max_fit_h
+end
+
+-- ループ
+local function warp(idx, size)
+    if size == 1 then return 0 end
+    idx = ((idx % size) + size) % size
+    return idx
+end
+
+-- 鏡面反射
+local function reflect(idx, size)
+    if size == 1 then return 0 end
+    local range = (size - 1) * 2
+    idx = math.abs(idx) % range
+    if idx >= size then
+        idx = math.max(range - idx, 0)
+    end
+    return idx
+end
+
+if obj.getoption("track_mode", 0) == 0 then
+	obj.setanchor("pos", 2, "loop")
+else
+	obj.setanchor("pos", 4, "loop", "inout")
+	time = time / 100
+	for i = 1, 4 do
+		pos[i] = pos[i] + (pos[i+4] - pos[i]) * time
+	end
+end
+
+local pos_x0, pos_y0, pos_x1, pos_y1 = unpack(pos)
+
+local max_w, max_h = obj.getinfo("image_max")
+local dst_w = math.min(math.floor(math.abs(pos_x0 - pos_x1)), max_w)
+local dst_h = math.min(math.floor(math.abs(pos_y0 - pos_y1)), max_h)
+
+if dst_w * dst_h == 0 then
+    obj.effect("リサイズ", "拡大率", 0)
+    return
+end
+
+local min_fit_w, min_fit_h = minFit(w, h, dst_w, dst_h)
+if min_fit_w * min_fit_h == 0 then
+    obj.effect("リサイズ", "拡大率", 0)
+    return
+end
+
+-- 境界処理
+if keep_aspect_ratio then
+
+    -- 長い辺に合わせる
+    if ratio_base then
+        local max_fit_w, max_fit_h = maxFit(w, h, dst_w, dst_h)
+        obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+        obj.effect("リサイズ", "X", max_fit_w, "Y", max_fit_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+        obj.draw()
+        obj.copybuffer("obj", "tmp")
+    else
+        -- 透明
+        if border_type == 0 then
+            obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+            obj.effect("リサイズ", "X", min_fit_w, "Y", min_fit_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+            obj.draw()
+            obj.copybuffer("obj", "tmp")
+
+        -- 塗りつぶし
+        elseif border_type == 1 then
+            obj.effect("リサイズ", "X", min_fit_w, "Y", min_fit_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+
+            local cx = math.ceil ((dst_w - min_fit_w) / 2)
+            local fx = math.floor((dst_w - min_fit_w) / 2)
+            local cy = math.ceil ((dst_h - min_fit_h) / 2)
+            local fy = math.floor((dst_h - min_fit_h) / 2)
+
+            local r, g, b = RGB(color)
+
+            if lua_jit == false then
+                obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+                obj.draw()
+                obj.copybuffer("obj", "tmp")
+
+                obj.pixeloption("type", "rgb")
+                for y=0, dst_h-1 do
+                    for x=0, dst_w-1 do
+                        if (x < cx or x >= fx + min_fit_w) or (y < cy or y >= fy + min_fit_h) then
+                            obj.putpixel(x, y, r, g, b, 255)
+                        end
+                    end
+                end
+            else
+                local src_data, _, _ = obj.getpixeldata("alloc")
+                local csrc = ffi.cast("PixelBGRA*", src_data)
+
+                obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+                obj.draw()
+                obj.copybuffer("obj", "tmp")
+
+                local dst_data, _, _ = obj.getpixeldata("alloc")
+                local cdst = ffi.cast("PixelBGRA*", dst_data)
+
+                for y=0, dst_h-1 do
+                    for x=0, dst_w-1 do
+                        if (x < cx or x >= fx + min_fit_w) or (y < cy or y >= fy + min_fit_h) then
+                            cdst[y * dst_w + x] = {g, b, r, 255}
+                        end
+                    end
+                end
+                obj.putpixeldata(dst_data)
+            end
+
+        -- 拡張
+        elseif border_type == 2 then
+            obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+            obj.effect("リサイズ", "X", min_fit_w, "Y", min_fit_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+
+            local pad_w = math.ceil((dst_w - min_fit_w) / 2)
+            local pad_h = math.ceil((dst_h - min_fit_h) / 2)
+            obj.effect("領域拡張", "上", pad_h, "下", pad_h, "左", pad_w, "右", pad_w, "塗りつぶし", 1)
+
+            obj.draw()
+            obj.copybuffer("obj", "tmp")
+
+        -- ループ
+        elseif border_type == 3 then
+            obj.effect("リサイズ", "X", min_fit_w, "Y", min_fit_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+
+            local cx = math.ceil ((dst_w - min_fit_w) / 2)
+            local fx = math.floor((dst_w - min_fit_w) / 2)
+            local cy = math.ceil ((dst_h - min_fit_h) / 2)
+            local fy = math.floor((dst_h - min_fit_h) / 2)
+
+            if lua_jit == false then
+                -- 短い辺に合わせた画像をサンプリングしておく
+                local pixels = {}
+                for y=1, min_fit_h do
+                    pixels[y] = {}
+                    for x=1, min_fit_w do
+                        pixels[y][x] = {obj.getpixel(x-1, y-1, "col")}
+                    end
+                end
+
+                -- リサイズ後の大きさの仮想バッファの上に描画
+                obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+                obj.draw()
+                obj.copybuffer("obj", "tmp")
+
+                -- 境界部分に短い辺に合わせた画像を描画
+                for y=0, dst_h-1 do
+                    for x=0, dst_w-1 do
+                        if (x < cx or x >= fx + min_fit_w) or (y < cy or y >= fy + min_fit_h) then
+                            local warp_x = warp(x - cx, min_fit_w)
+                            local warp_y = warp(y - cy, min_fit_h)
+                            obj.putpixel(x, y, pixels[warp_y+1][warp_x+1][1], pixels[warp_y+1][warp_x+1][2])
+                        end
+                    end
+                end
+            else
+                local src_data, _, _ = obj.getpixeldata("alloc")
+                local csrc = ffi.cast("PixelBGRA*", src_data)
+
+                obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+                obj.draw()
+                obj.copybuffer("obj", "tmp")
+
+                local dst_data, _, _ = obj.getpixeldata("alloc")
+                local cdst = ffi.cast("PixelBGRA*", dst_data)
+
+                for y=0, dst_h-1 do
+                    for x=0, dst_w-1 do
+                        if (x < cx or x >= fx + min_fit_w) or (y < cy or y >= fy + min_fit_h) then
+                            local warp_x = warp(x - cx, min_fit_w)
+                            local warp_y = warp(y - cy, min_fit_h)
+                            cdst[y * dst_w + x] = csrc[warp_y * min_fit_w + warp_x]
+                        end
+                    end
+                end
+                obj.putpixeldata(dst_data)
+            end
+
+        -- 反射
+        elseif border_type == 4 then
+            obj.effect("リサイズ", "X", min_fit_w, "Y", min_fit_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+
+            local cx = math.ceil ((dst_w - min_fit_w) / 2)
+            local fx = math.floor((dst_w - min_fit_w) / 2)
+            local cy = math.ceil ((dst_h - min_fit_h) / 2)
+            local fy = math.floor((dst_h - min_fit_h) / 2)
+
+            if lua_jit == false then
+                local pixels = {}
+                for y=1, min_fit_h do
+                    pixels[y] = {}
+                    for x=1, min_fit_w do
+                        pixels[y][x] = {obj.getpixel(x-1, y-1, "col")}
+                    end
+                end
+
+                obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+                obj.draw()
+                obj.copybuffer("obj", "tmp")
+
+                for y=0, dst_h-1 do
+                    for x=0, dst_w-1 do
+                        if (x < cx or x >= fx + min_fit_w) or (y < cy or y >= fy + min_fit_h) then
+                            local ref_x = reflect(x - cx, min_fit_w)
+                            local ref_y = reflect(y - cy, min_fit_h)
+                            obj.putpixel(x, y, pixels[ref_y+1][ref_x+1][1], pixels[ref_y+1][ref_x+1][2])
+                        end
+                    end
+                end
+            else
+                local src_data, _, _ = obj.getpixeldata("alloc")
+                local csrc = ffi.cast("PixelBGRA*", src_data)
+
+                obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+                obj.draw()
+                obj.copybuffer("obj", "tmp")
+
+                local dst_data, _, _ = obj.getpixeldata("alloc")
+                local cdst = ffi.cast("PixelBGRA*", dst_data)
+
+                for y=0, dst_h-1 do
+                    for x=0, dst_w-1 do
+                        if (x < cx or x >= fx + min_fit_w) or (y < cy or y >= fy + min_fit_h) then
+                            local ref_x = reflect(x - cx, min_fit_w)
+                            local ref_y = reflect(y - cy, min_fit_h)
+                            cdst[y * dst_w + x] = csrc[ref_y * min_fit_w + ref_x]
+                        end
+                    end
+                end
+                obj.putpixeldata(dst_data)
+            end
+
+        -- ぼかし
+        elseif border_type == 5 then
+            obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+
+            -- 長い辺に合わせた画像をぼかして描画
+            local max_fit_w, max_fit_h = maxFit(w, h, dst_w, dst_h)
+            obj.effect("リサイズ", "X", max_fit_w, "Y", max_fit_h, "補間なし", 0, "ドット数でサイズ指定", 1)
+            obj.effect("ぼかし", "範囲", blur_strength, "サイズ固定", 1)
+            obj.draw()
+            obj.copybuffer("obj", "tmp")
+
+            local cx = math.ceil ((dst_w - min_fit_w) / 2)
+            local fx = math.floor((dst_w - min_fit_w) / 2)
+            local cy = math.ceil ((dst_h - min_fit_h) / 2)
+            local fy = math.floor((dst_h - min_fit_h) / 2)
+
+            if lua_jit == false then
+                -- ぼかした画像をサンプリングしておく
+                local pixels = {}
+                for y=1, dst_h do
+                    pixels[y] = {}
+                    for x=1, dst_w do
+                        pixels[y][x] = {obj.getpixel(x-1, y-1, "col")}
+                    end
+                end
+
+                -- 短い辺に合わせてリサイズした画像を描画
+                obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+                obj.copybuffer("obj", "cache:oar_rsz_anc_ori_img")
+                obj.effect("リサイズ", "X", min_fit_w, "Y", min_fit_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+                obj.draw()
+                obj.copybuffer("obj", "tmp")
+
+                -- 境界部分ににぼかした画像を描画
+                for y=0, dst_h-1 do
+                    for x=0, dst_w-1 do
+                        if (x < cx or x >= fx + min_fit_w) or (y < cy or y >= fy + min_fit_h) then
+                            obj.putpixel(x, y, pixels[y+1][x+1][1], pixels[y+1][x+1][2])
+                        end
+                    end
+                end
+            else
+                local src_data, _, _ = obj.getpixeldata("alloc")
+                local csrc = ffi.cast("PixelBGRA*", src_data)
+
+                obj.setoption("drawtarget", "tempbuffer", dst_w, dst_h)
+                obj.copybuffer("obj", "cache:oar_rsz_anc_ori_img")
+                obj.effect("リサイズ", "X", min_fit_w, "Y", min_fit_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+                obj.draw()
+                obj.copybuffer("obj", "tmp")
+
+                local dst_data, _, _ = obj.getpixeldata("alloc")
+                local cdst = ffi.cast("PixelBGRA*", dst_data)
+
+                for y=0, dst_h-1 do
+                    for x=0, dst_w-1 do
+                        if (x < cx or x >= fx + min_fit_w) or (y < cy or y >= fy + min_fit_h) then
+                            cdst[y * dst_w + x] = csrc[y * dst_w + x]
+                        end
+                    end
+                end
+                obj.putpixeldata(dst_data)
+            end
+        end
+    end
+else
+    obj.effect("リサイズ", "X", dst_w, "Y", dst_h, "補間なし", interp, "ドット数でサイズ指定", 1)
+end
+
+-- 反転処理
+if flip == false then
+    if pos_x1 < pos_x0 then obj.effect("反転", "左右反転", 1) end
+    if pos_y1 < pos_y0 then obj.effect("反転", "上下反転", 1) end
+end
+
+-- アンカーの位置に合わせる
+local cx = (pos_x1 + pos_x0) / 2
+local cy = (pos_y1 + pos_y0) / 2
+
+obj.cx = obj.cx - cx
+obj.cy = obj.cy - cy
