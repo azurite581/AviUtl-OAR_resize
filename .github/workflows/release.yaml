@@ -26,21 +26,13 @@ jobs:
       with:
         fetch-depth: 0
 
-    # github.ref_name ではなく git describe でタグを手動することで
-    # 手動実行でリリースノートを生成する際に最新のタグを取得できる
-    - name: Check for latest tag
-      id: tag
-      run: |
-        latest_tag=$(git describe --tags --abbrev=0)
-        echo "version=${latest_tag}" >> "${GITHUB_OUTPUT}"
-
     - name: Create zip archive
       run: zip -r "OAR_resize_${VERSION}.zip" @OAR_resize.anm README.md LICENSE.txt
       env:
-        VERSION: ${{steps.tag.outputs.version}}
+        VERSION: ${{github.ref_name}}
 
     - name: Create release notes
       run: gh release create "${VERSION}" --generate-notes ${{github.workspace}}/*.zip
       env:
-        VERSION: ${{steps.tag.outputs.version}}
+        VERSION: ${{github.ref_name}}
         GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
